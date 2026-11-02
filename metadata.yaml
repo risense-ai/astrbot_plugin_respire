@@ -1,0 +1,25 @@
+name: astrbot_plugin_respire
+display_name: Respire 记忆
+short_desc: 本地优先、端侧加密的跨会话长期记忆，支持因果链检索与判后即存。
+desc: |
+  为 AstrBot 接入 [Respire](https://rsrs.rs)（CLI 名 `rsrs`）本地优先加密记忆库。
+
+  - 每轮按用户消息自动召回标题档（分数 + 8 位短 id + 标题），正文按需读取；
+  - 提供 `respire_recall` / `respire_show` / `respire_remember` / `respire_update` /
+    `respire_merge` / `respire_attach` 六个 LLM 工具；
+  - 提供 `/respire`（别名 `/rsrs`）指令：status / recall / show / remember / forget / help；
+  - 记忆正文默认以临时 user content part 注入，不污染会话历史；系统提示只放稳定规则；
+  - 引擎缺失、未初始化、超时或回执异常时一律 fail-open，不阻断聊天；
+  - 默认仅管理员可用、群聊关闭，避免个人记忆跨用户泄漏。
+
+  引擎是独立的 `rsrs` CLI（`npm i -g rsrs-cli`），插件不捆绑、不下载模型。
+version: 0.1.0
+author: risense
+repo: https://github.com/risense-ai/astrbot_plugin_respire
+astrbot_version: ">=4.16,<5"
+tags:
+  - memory
+  - respire
+  - rsrs
+  - local-first
+  - encrypted

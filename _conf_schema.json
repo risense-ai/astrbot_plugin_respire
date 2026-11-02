@@ -1,0 +1,159 @@
+{
+  "enabled": {
+    "description": "总开关",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后不再自动召回，LLM 工具和 /respire 指令也会拒绝访问。"
+  },
+  "rsrs_path": {
+    "description": "rsrs CLI 路径",
+    "type": "string",
+    "default": "",
+    "hint": "留空自动探测 PATH、~/.local/bin、~/.rsrs/bin 等位置。"
+  },
+  "access_mode": {
+    "description": "记忆访问范围",
+    "type": "string",
+    "default": "admin",
+    "options": ["admin", "allowlist", "all"],
+    "labels": ["仅管理员", "管理员 + 白名单", "所有用户"],
+    "hint": "默认只允许 AstrBot 管理员。多用户部署建议配合 scope_mode=sender。"
+  },
+  "allowed_users": {
+    "description": "允许访问记忆的用户 ID",
+    "type": "list",
+    "default": [],
+    "hint": "access_mode=allowlist 时生效；管理员始终可用。"
+  },
+  "group_memory": {
+    "description": "允许群聊使用记忆",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭，避免把个人记忆注入群聊上下文。开启后仍受 access_mode 限制。"
+  },
+  "auto_recall": {
+    "description": "每轮自动召回",
+    "type": "bool",
+    "default": true,
+    "hint": "按用户消息召回标题档并注入本轮请求；正文由 LLM 按需调用 respire_show。"
+  },
+  "recall_limit": {
+    "description": "自动召回条数",
+    "type": "int",
+    "default": 5,
+    "slider": {"min": 1, "max": 20, "step": 1}
+  },
+  "recall_threshold": {
+    "description": "召回分数下限",
+    "type": "float",
+    "default": 0.0,
+    "slider": {"min": 0, "max": 1, "step": 0.01},
+    "hint": "0 表示直接采用 rsrs 自带的相关性门，不做额外过滤。"
+  },
+  "min_prompt_chars": {
+    "description": "自动召回的最短消息长度",
+    "type": "int",
+    "default": 2,
+    "slider": {"min": 1, "max": 50, "step": 1}
+  },
+  "budget_chars": {
+    "description": "单轮召回注入字数预算",
+    "type": "int",
+    "default": 1200,
+    "slider": {"min": 200, "max": 8000, "step": 100}
+  },
+  "max_show_chars": {
+    "description": "单条正文读取上限",
+    "type": "int",
+    "default": 8000,
+    "slider": {"min": 1000, "max": 40000, "step": 1000}
+  },
+  "max_tool_chars": {
+    "description": "工具/指令返回上限",
+    "type": "int",
+    "default": 6000,
+    "slider": {"min": 1000, "max": 30000, "step": 1000}
+  },
+  "session_rules": {
+    "description": "注入记忆使用简则",
+    "type": "bool",
+    "default": true,
+    "hint": "把稳定的 Respire 使用规则追加到 system prompt；动态召回走临时 user content part。"
+  },
+  "scope_mode": {
+    "description": "记忆作用域",
+    "type": "string",
+    "default": "global",
+    "options": ["global", "sender", "session"],
+    "labels": ["全局共享", "按发送者", "按会话"],
+    "hint": "global 适合个人机器人；sender/session 通过 rsrs --project 做软隔离，不是加密级隔离。"
+  },
+  "project_prefix": {
+    "description": "作用域前缀",
+    "type": "string",
+    "default": "astrbot",
+    "hint": "scope_mode=sender/session 时写入 rsrs 的 project 字段。"
+  },
+  "store_prefixes": {
+    "description": "存储请求前缀",
+    "type": "list",
+    "default": ["记：", "记:", "存：", "存:", "remember:", "store:"],
+    "hint": "以这些前缀开头的消息只作为待存事实交给模型审查，不会自动写入。"
+  },
+  "store_nudge_every": {
+    "description": "存储催促间隔",
+    "type": "int",
+    "default": 0,
+    "slider": {"min": 0, "max": 50, "step": 1},
+    "hint": "0 关闭；N 表示每 N 轮在无落库时附一句提醒。"
+  },
+  "nudge_min_interval": {
+    "description": "存储催促最小间隔（秒）",
+    "type": "int",
+    "default": 600,
+    "slider": {"min": 60, "max": 7200, "step": 60}
+  },
+  "command_store_importance": {
+    "description": "/respire remember 的默认档位",
+    "type": "string",
+    "default": "important",
+    "options": ["important", "trivial"],
+    "labels": ["重要（需父节点）", "日记（免父节点）"]
+  },
+  "default_parent": {
+    "description": "默认父节点 ID",
+    "type": "string",
+    "default": "",
+    "hint": "可为 /respire remember 的重要记忆指定默认父节点；留空则要求显式 --parent。"
+  },
+  "recall_timeout": {
+    "description": "召回超时（秒）",
+    "type": "int",
+    "default": 14,
+    "slider": {"min": 3, "max": 60, "step": 1}
+  },
+  "write_timeout": {
+    "description": "写入/候选审查超时（秒）",
+    "type": "int",
+    "default": 20,
+    "slider": {"min": 5, "max": 120, "step": 1}
+  },
+  "status_timeout": {
+    "description": "状态探测超时（秒）",
+    "type": "int",
+    "default": 10,
+    "slider": {"min": 3, "max": 60, "step": 1}
+  },
+  "probe_ttl": {
+    "description": "状态缓存时间（秒）",
+    "type": "int",
+    "default": 300,
+    "slider": {"min": 30, "max": 3600, "step": 30}
+  },
+  "log": {
+    "description": "记录诊断日志",
+    "type": "bool",
+    "default": true,
+    "hint": "只记录事件码、长度和脱敏后的错误，不记录记忆正文或查询原文。"
+  }
+}
