@@ -2,7 +2,7 @@
 
 > 目录：`/Users/shiningray/projects/risense/astrbot_plugin_respire`
 > 状态时间：2026-11-03
-> 当前版本：0.1.0（未发版、未 git init、未提交）
+> 当前版本：0.1.0（已 git init 并本地提交；未推远端、未发版）
 
 ## 1. 目标
 
@@ -31,12 +31,14 @@
 | 配置 schema | 完成 | 25 个配置项，validator 与 `DEFAULTS` 键一致 |
 | 结构自检 | 完成 | `scripts/validate_plugin.py`：109 passed, 0 failed |
 | AstrBot 真实导入 | 完成 | venv 中导入：15 个 handler、6 个 tool，schema 类型解析正确 |
-| 桩 CLI 端到端 | 部分完成 | 假 CLI 下 hook/recall/remember/show/update/merge/attach 均返回；最新补丁后未重跑 |
-| 真实 rsrs 只读 | 完成（手工） | 本机 `rsrs status` / `recall` / `taxonomy` / `tree` 可读 |
-| 单元测试文件 | 未完成 | `tests/` 仍为空 |
-| AstrBot PluginManager 真实加载 | 未完成 | 只做过直接 import，未走 `PluginManager.load()` |
+| 桩 CLI 端到端 | 完成 | `tests/test_plugin.py` 桩 CLI 全路径 93 项断言 |
+| 真实 rsrs 只读 | 完成 | 测试内实跑 `status`/`recall`/`candidates`；无 rsrs 或 CI 设 `RSRS_TEST_SKIP_REAL` 时跳过 |
+| 单元测试文件 | 完成 | `tests/test_plugin.py`（93 项）+ `tests/test_real_load.py`（子进程真实加载），94 passed |
+| AstrBot PluginManager 真实加载 | 完成 | `tests/test_real_load.py`：临时 `ASTRBOT_ROOT` + `PluginManager.load(specified_dir_name=...)`，断言元数据、schema 默认配置、15 handler 绑定、6 tool 激活、钩子注入、指令响应 |
 | 真机聊天/WebUI | 未完成 | 未启动 AstrBot 实例发消息验证 |
-| git / CI / 发版 | 未开始 | 未 `git init`，无 release workflow |
+| git / CI / 发版 | 部分完成 | 已 `git init` + 本地提交；`scripts/package.sh`（zip 根=插件根）与 tag 触发 `.github/workflows/release.yml` 就绪；未推远端、未发版 |
+
+补充：2026-11-03 修掉 main.py 三处真实 bug——`_store`/`_update`/`_merge` 把 `show` 回读的整个 JSON 信封当成 entry 传给 `_format_store_result`，导致回读校验恒报 mismatch；已改为取 `details`，测试断言 `Read-back verified` 通过。
 
 ## 3. 架构
 
@@ -164,35 +166,14 @@ AstrBot 不保证模型有 shell 工具，所以把 Respire 的关键动作做�
 
 ## 6. 待办（按优先级）
 
-1. **清理生成物**：导入 AstrBot 时在插件目录生成了 `data/`、`__pycache__/`；已删除，后续测试应把 `ASTRBOT_ROOT` 指向临时目录，避免再生成。
-2. **重跑假 CLI 测试**：最新补丁（`_update` 回读、`--trivial/--important` 解析、闭合标签常量）后尚未重跑。
-3. **写 `tests/test_plugin.py`**：
-   - 纯函数：`format_recall` 预算/阈值、`parse_envelope` 容错、`extract_title`、`contains_secret`、`sidecar_env` 不透传 token；
-   - 桩 CLI：`on_llm_request` 注入、去重、群聊关闭、非管理员拒绝、store pending、parent 校验、回读核验、六个工具；
-   - 真实 rsrs 只读：`status` / `recall`，无 rsrs 时 skip；
-   - AstrBot 真实加载：`PluginManager.load()`，检查 metadata/config/handlers/tools。
-4. **真实 AstrBot 加载验证**：
-   - `ASTRBOT_ROOT` 指向临时目录；
-   - 把插件目录放进 `data/plugins/`；
-   - 构造最小 `Context` 或使用 `PluginManager` + stub context；
-   - 验证 `metadata.yaml`、`_conf_schema.json` 默认配置、handler 绑定、tool active。
-5. **事件管线验证**：
-   - 构造 `AstrMessageEvent` / `ProviderRequest`；
-   - 验证私聊管理员注入、群聊默认不注入、`scope_mode=sender` 传 `--project`、`/nomem` 跳过。
-6. **命令行为验证**：
-   - `/respire status|recall|show|remember|forget|help`；
-   - `--parent` / `--importance` / `--trivial` 解析；
-   - `forget` 必须管理员 + `--yes`。
-7. **README 校正**：当前写“仅在 macOS 与 AstrBot 4.29.4 上做真机加载验证”，但实际只做到直接 import；应改为“导入验证，PluginManager/聊天验证待补”，或完成真机加载后再写“真机加载”。
-8. **可选**：
+1. **真实 AstrBot 实例聊天/WebUI 端到端**：启动 AstrBot（`ASTRBOT_ROOT` 指向临时目录），配一个真实 LLM 提供商，验证私聊管理员自动召回、`记：` 前缀审查流、`/respire` 指令全链。
+2. **远端与发版**：建 `risense-ai/astrbot_plugin_respire` 远端并推送；打 `v0.1.0` tag 走 release workflow；用 AstrBot 市场安装链路实测一次 zip。
+3. **可选**：
    - `skills/respire/SKILL.md`（AstrBot Skill Manager 自动加载）；
-   - `scripts/package.sh` + `.github/workflows/release.yml`（zip 根=插件根，≤16 MB）；
    - `docs/` 发布到 respire-docs；
-   - `git init` + 远端 `risense-ai/astrbot_plugin_respire`。
-9. **发版前**：
-   - 版本号 `metadata.yaml` / `PLUGIN_VERSION` / `CHANGELOG.md` 三处一致；
-   - zip 不含 `__pycache__`、`.git`、`data/`、测试临时文件；
-   - 用 AstrBot 市场安装链路实测一次。
+   - 工具 schema 等 AstrBot 上游支持 `required` 后补充必填标记。
+
+以上 1、2 完成前，README「已知边界」中的口径（导入+真实加载已验、聊天端到端待补）保持现状。
 
 ## 7. 已知风险 / 待决
 
@@ -235,3 +216,4 @@ rsrs taxonomy --list --json
 - 2026-11-03：确定“标题档自动召回 + 六个结构化工具 + 判后即存 + 默认管理员/群聊关闭”的方案。
 - 2026-11-03：完成 `main.py` 0.1.0 骨架、配置、元数据、README、validator。
 - 2026-11-03：AstrBot 4.29.4 导入验证通过；待补测试与真实加载。
+- 2026-11-03：测试补全并修回读 bug；pytest 94 项全绿（含真实 rsrs 只读探针与子进程真实 `PluginManager.load()`）；`package.sh` + release workflow + 本地 git 提交。
