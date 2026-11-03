@@ -10,10 +10,11 @@ desc: |
   - 提供 `/respire`（别名 `/rsrs`）指令：status / recall / show / remember / forget / help；
   - 记忆正文默认以临时 user content part 注入，不污染会话历史；系统提示只放稳定规则；
   - 引擎缺失、未初始化、超时或回执异常时一律 fail-open，不阻断聊天；
-  - 默认仅管理员可用、群聊关闭，避免个人记忆跨用户泄漏。
+  - 默认仅管理员可用、群聊关闭，避免个人记忆跨用户泄漏；
+  - 可选 `isolation_mode=bot`：按机器人映射独立 rsrs space，机器人之间硬隔离，人格之间用 project 软隔离。
 
   引擎是独立的 `rsrs` CLI（`npm i -g rsrs-cli`），插件不捆绑、不下载模型。
-version: 0.1.0
+version: 0.2.0
 author: risense
 repo: https://github.com/risense-ai/astrbot_plugin_respire
 astrbot_version: ">=4.16,<5"
@@ -23,3 +24,4 @@ tags:
   - rsrs
   - local-first
   - encrypted
+  - isolation

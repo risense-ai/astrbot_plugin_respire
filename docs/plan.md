@@ -2,7 +2,7 @@
 
 > 目录：`/Users/shiningray/projects/risense/astrbot_plugin_respire`
 > 状态时间：2026-11-03
-> 当前版本：0.1.0（已 git init 并本地提交；未推远端、未发版）
+> 当前版本：0.2.0（本地改动；0.1.0 已发布 GitHub）
 
 ## 1. 目标
 
@@ -28,15 +28,16 @@
 | 写入回读 | 完成 | 成功写入后 `rsrs show` 核对 id、标题、完整正文 |
 | fail-open | 完成 | 所有 hook/tool/command 捕获异常；子进程超时/坏 JSON 降级为空 |
 | 密钥与日志保护 | 完成 | 最小子进程环境；凭据模式跳过；日志脱敏 |
-| 配置 schema | 完成 | 25 个配置项，validator 与 `DEFAULTS` 键一致 |
-| 结构自检 | 完成 | `scripts/validate_plugin.py`：109 passed, 0 failed |
+| 机器人级硬隔离 | 完成 | `isolation_mode=bot` + `bot_profiles` → `RSRS_DATA_DIR`；人格用 `scope_mode=persona` 软隔离；110 项测试 |
+| 配置 schema | 完成 | 30 个配置项，validator 与 `DEFAULTS` 键一致 |
+| 结构自检 | 完成 | `scripts/validate_plugin.py`：124 passed, 0 failed |
 | AstrBot 真实导入 | 完成 | venv 中导入：15 个 handler、6 个 tool，schema 类型解析正确 |
-| 桩 CLI 端到端 | 完成 | `tests/test_plugin.py` 桩 CLI 全路径 93 项断言 |
+| 桩 CLI 端到端 | 完成 | `tests/test_plugin.py` 桩 CLI 全路径，含隔离/作用域/profile 缓存 |
 | 真实 rsrs 只读 | 完成 | 测试内实跑 `status`/`recall`/`candidates`；无 rsrs 或 CI 设 `RSRS_TEST_SKIP_REAL` 时跳过 |
-| 单元测试文件 | 完成 | `tests/test_plugin.py`（93 项）+ `tests/test_real_load.py`（子进程真实加载），94 passed |
+| 单元测试文件 | 完成 | `tests/test_plugin.py` + `tests/test_real_load.py`，110 passed |
 | AstrBot PluginManager 真实加载 | 完成 | `tests/test_real_load.py`：临时 `ASTRBOT_ROOT` + `PluginManager.load(specified_dir_name=...)`，断言元数据、schema 默认配置、15 handler 绑定、6 tool 激活、钩子注入、指令响应 |
 | 真机聊天/WebUI | 未完成 | 未启动 AstrBot 实例发消息验证 |
-| git / CI / 发版 | 部分完成 | 已 `git init` + 本地提交；`scripts/package.sh`（zip 根=插件根）与 tag 触发 `.github/workflows/release.yml` 就绪；未推远端、未发版 |
+| git / CI / 发版 | 部分完成 | 0.1.0 已推 GitHub 并发 release；0.2.0 本地改动未发版；`scripts/package.sh` 与 tag 触发 `.github/workflows/release.yml` 就绪 |
 
 补充：2026-11-03 修掉 main.py 三处真实 bug——`_store`/`_update`/`_merge` 把 `show` 回读的整个 JSON 信封当成 entry 传给 `_format_store_result`，导致回读校验恒报 mismatch；已改为取 `details`，测试断言 `Read-back verified` 通过。
 
@@ -66,7 +67,7 @@ AstrBot 事件
 | --- | --- |
 | `main.py` | 唯一入口；插件类、hooks、commands、LLM tools、rsrs 子进程封装、格式化与守卫 |
 | `metadata.yaml` | AstrBot 元数据；`name: astrbot_plugin_respire` |
-| `_conf_schema.json` | WebUI 配置 schema；25 项 |
+| `_conf_schema.json` | WebUI 配置 schema；30 项 |
 | `requirements.txt` | 无第三方 Python 依赖 |
 | `logo.png` | 256×256，1:1 |
 | `README.md` | 安装、配置、命令、工具、安全边界 |
@@ -147,9 +148,9 @@ AstrBot 不保证模型有 shell 工具，所以把 Respire 的关键动作做�
   - `limit` / `chain_depth` 为 `number`；
 - `on_llm_request` 注入 `TextPart`，内容包含 `<respire_memory>` 标题块；
 - 假 CLI 下 `respire_recall`、`respire_remember`（无父/有父）、`respire_show`、`respire_update`、`respire_merge`、`respire_attach` 均能返回；
-- `scripts/validate_plugin.py` 109 项全过。
+- `scripts/validate_plugin.py` 124 项全过。
 
-尚未完成：真实 `PluginManager.load()`、真实 AstrBot 事件管线、真实 WebUI/聊天。
+尚未完成：真实 AstrBot 实例聊天/WebUI 端到端；PluginManager 真实加载已在测试中完成。
 
 ### 5.2 rsrs CLI 侧
 
@@ -217,3 +218,4 @@ rsrs taxonomy --list --json
 - 2026-11-03：完成 `main.py` 0.1.0 骨架、配置、元数据、README、validator。
 - 2026-11-03：AstrBot 4.29.4 导入验证通过；待补测试与真实加载。
 - 2026-11-03：测试补全并修回读 bug；pytest 94 项全绿（含真实 rsrs 只读探针与子进程真实 `PluginManager.load()`）；`package.sh` + release workflow + 本地 git 提交。
+- 2026-11-03：实现方式 1“机器人级硬隔离 + 人格级软隔离”：`isolation_mode=bot`、`bot_profiles`、`profile_fallback`、`m3_dir`、`space_list_ttl`；新增 `persona`/`bot_persona` 作用域；pytest 110 项通过；真实 `rsrs space list` 与 `RSRS_DATA_DIR` recall 手工验证。

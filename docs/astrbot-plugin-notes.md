@@ -158,6 +158,8 @@ req.extra_user_content_parts.append(
 - `event.unified_msg_origin`：`platform:message_type:session_id`
 - `event.get_sender_id()` / `get_sender_name()`
 - `event.get_platform_id()` / `get_platform_name()`
+- `event.get_self_id()`：机器人账号 ID（QQ 号、Telegram username 等）
+- `event.get_extra("_trace_persona_id")`：核心在 `apply_persona()` 后写入的最终人格 ID；命令路径可能尚未设置，需要回退 `conversation.persona_id`
 - `event.is_private_chat()`
 - `event.is_admin()`
 - `event.get_extra(key, default)` / `set_extra(key, value)`

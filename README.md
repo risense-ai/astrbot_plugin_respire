@@ -8,6 +8,7 @@
 - **管理指令**：`/respire status|recall|show|remember|forget|help`，别名 `/rsrs`。
 - **fail-open**：引擎缺失、未初始化、超时、JSON 异常都只跳过记忆层，不阻断聊天。
 - **默认安全**：仅管理员可用、群聊记忆关闭；个人记忆不会被普通群成员注入上下文。
+- **机器人级硬隔离**：`isolation_mode=bot` 按 `platform_id + self_id` 将每个机器人映射到独立 rsrs space；人格用 `--project` 软隔离。
 - **无 Python 依赖面**：引擎是独立 `rsrs` CLI，插件目录没有第三方 Python 包。
 
 English overview: this is the AstrBot plugin for Respire (`rsrs`). It injects title-tier recall per turn, exposes reviewed memory tools, and fails open when the local engine is unavailable. Access is administrator-only and group-chat memory is off by default.
@@ -60,6 +61,11 @@ WebUI → 插件 → Respire 记忆。
 | --- | --- | --- |
 | `enabled` | `true` | 总开关；关闭后自动召回、工具和指令都拒绝访问 |
 | `rsrs_path` | `""` | 留空自动探测 PATH、`~/.local/bin`、`~/.rsrs/bin` 等 |
+| `isolation_mode` | `off` | `off` / `bot`；`bot` 为每个机器人选择独立 rsrs space/account 数据目录 |
+| `bot_profiles` | `[]` | 机器人映射：`{match: "bot:<platform_id>:<self_id>", space: "<space 名>"}` |
+| `profile_fallback` | `deny` | 机器人未匹配时：`deny` 拒绝记忆操作 / `main` 落主库 |
+| `m3_dir` | `""` | 共享 BGE-M3 模型目录；留空自动尝试 `~/.rsrs/models/bge-m3` |
+| `space_list_ttl` | `60` | `rsrs space list` 缓存秒数 |
 | `access_mode` | `admin` | `admin` / `allowlist` / `all` |
 | `allowed_users` | `[]` | `allowlist` 模式下的用户 ID；管理员始终可用 |
 | `group_memory` | `false` | 群聊是否允许记忆；默认关闭，避免个人记忆进入群聊上下文 |
@@ -71,7 +77,7 @@ WebUI → 插件 → Respire 记忆。
 | `max_show_chars` | `8000` | 单条正文读取上限 |
 | `max_tool_chars` | `6000` | 工具/指令返回上限 |
 | `session_rules` | `true` | 把稳定的记忆使用规则追加到 system prompt |
-| `scope_mode` | `global` | `global` / `sender` / `session`；后两者通过 `--project` 做软隔离 |
+| `scope_mode` | `global` | `global` / `sender` / `session` / `persona` / `bot_persona`；后四者通过 `--project` 做软隔离 |
 | `project_prefix` | `astrbot` | 作用域前缀 |
 | `store_prefixes` | `["记：","记:","存：","存:","remember:","store:"]` | 存储请求前缀；只交给模型审查，不自动写 |
 | `store_nudge_every` | `0` | 0 关闭；N 表示每 N 轮无落库时附一句提醒 |
@@ -84,15 +90,51 @@ WebUI → 插件 → Respire 记忆。
 | `probe_ttl` | `300` | 状态缓存时间（秒） |
 | `log` | `true` | 诊断日志；不记录正文或查询原文 |
 
+### 机器人级硬隔离 + 人格级软隔离
+
+推荐用于“一台 AstrBot 跑多个机器人，同一机器人下有多个人格”的部署：
+
+```json
+{
+  "isolation_mode": "bot",
+  "scope_mode": "persona",
+  "bot_profiles": [
+    {"match": "bot:qq_main:123456", "space": "astrbot_qq_main"},
+    {"match": "bot:telegram_main:mybot", "space": "astrbot_tg"},
+    {"match": "default", "space": "astrbot_default"}
+  ],
+  "profile_fallback": "deny",
+  "m3_dir": "~/.rsrs/models/bge-m3"
+}
+```
+
+行为：
+
+- 每个机器人按 `platform_id + self_id` 选一个 rsrs space；插件在每次 `rsrs` 子进程设置 `RSRS_DATA_DIR=<space dir>`，不同机器人是独立 store/session/keys。
+- 同一机器人内部，人格用 `--project astrbot:persona:<persona_id>` 软隔离；人格之间仍共用该机器人的加密库。
+- 机器人未匹配时默认 `deny`，不会静默落到主库；`profile_fallback=main` 可改为落主库。
+- 插件不调用 `rsrs space use`，不会全局切库；也不自动创建 space。
+- `space` 由用户在终端创建并注册：
+
+```bash
+rsrs space create astrbot_qq_main
+rsrs register --user <account>     # 或 rsrs keygen 纯本地
+rsrs space list --json             # 确认 dir 与 session
+```
+
+详细机制与取舍见 [`docs/isolation.md`](docs/isolation.md)。
+
 ### 作用域说明
 
-Respire 默认是一座用户级共享记忆库。AstrBot 可能同时服务多个用户，因此插件提供三种 `scope_mode`：
+Respire 默认是一座用户级共享记忆库。AstrBot 可能同时服务多个用户，因此插件提供五种 `scope_mode`：
 
 - `global`：不写 `project`，所有会话共享同一座库。适合个人机器人。
 - `sender`：`project = astrbot:<platform>:user:<sender>`，同一用户跨私聊/群聊共享，不同用户互不召回。
 - `session`：`project = astrbot:session:<umo>`，严格按会话分离。
+- `persona`：`project = astrbot:persona:<persona_id>`，同一机器人内按人格分离。
+- `bot_persona`：`project = astrbot:bot:<platform>:<self_id>:persona:<persona_id>`，用于纯软隔离模式下按机器人+人格分离。
 
-`sender` / `session` 是**软隔离**：它依赖 `rsrs recall --project` 过滤，不是加密级隔离。需要密码学隔离的多用户部署应使用独立 AstrBot 实例或独立 `RSRS_DATA_DIR`。
+`sender` / `session` / `persona` / `bot_persona` 都是**软隔离**：它们依赖 `rsrs recall --project` 过滤，不是加密级隔离。真正的跨机器人隔离由 `isolation_mode=bot` + `RSRS_DATA_DIR` 提供。
 
 ## 命令
 
@@ -135,15 +177,18 @@ Respire 默认是一座用户级共享记忆库。AstrBot 可能同时服务多�
 
 - 未实现 AstrBot WebUI 可视化页面；配置走原生 schema。
 - 不会自动选择父节点；父节点必须由模型或用户显式给出并已读。
-- `sender` / `session` 作用域不是加密隔离。
+- `sender` / `session` / `persona` / `bot_persona` 作用域不是加密隔离。
+- `isolation_mode=bot` 需要用户先创建并注册 rsrs space；未匹配/未初始化时默认 fail closed。
+- 每个独立 space 是一个独立的 rsrs runtime；多人格/多机器人硬隔离会增加内存占用。共享模型请设置 `m3_dir`，且应在该 profile 首次启动 runtime 前生效。
 - 插件不管理 `rsrs register` / `login` / `sync`；这些操作仍在本机终端完成。
-- 已在 macOS 上用 AstrBot 4.29.4 源码完成验证：直接导入注册（15 个 handler、6 个 tool）与真实 `PluginManager.load()` 加载（元数据、schema 默认配置、handler 绑定、tool 激活、钩子注入、指令响应）均通过 94 项自动化测试；真实聊天/WebUI 端到端验证待补。其他平台按 AstrBot/rsrs 官方支持范围推断。
+- 已在 macOS 上用 AstrBot 4.29.4 源码完成验证：直接导入注册（15 个 handler、6 个 tool）与真实 `PluginManager.load()` 加载（元数据、schema 默认配置、handler 绑定、tool 激活、钩子注入、指令响应）均通过 110 项自动化测试；真实聊天/WebUI 端到端验证待补。其他平台按 AstrBot/rsrs 官方支持范围推断。
 
 ## 设计与排障文档
 
 - [`docs/plan.md`](docs/plan.md)：方案、当前进度、待办、风险
 - [`docs/astrbot-plugin-notes.md`](docs/astrbot-plugin-notes.md)：AstrBot 4.29.4 插件 API、加载流程与坑
 - [`docs/respire-cli-notes.md`](docs/respire-cli-notes.md)：rsrs JSON 信封、判后即存、作用域与超时
+- [`docs/isolation.md`](docs/isolation.md)：按 AstrBot 机器人/人格做软隔离与 space 硬隔离的方案
 
 ## 开发
 

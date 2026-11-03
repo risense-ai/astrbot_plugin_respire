@@ -11,6 +11,59 @@
     "default": "",
     "hint": "留空自动探测 PATH、~/.local/bin、~/.rsrs/bin 等位置。"
   },
+  "isolation_mode": {
+    "description": "记忆隔离方式",
+    "type": "string",
+    "default": "off",
+    "options": ["off", "bot"],
+    "labels": ["关闭（共享主库）", "按机器人硬隔离"],
+    "hint": "按机器人硬隔离会为每个 bot 选择独立 rsrs space/account 数据目录；人格用 scope_mode 软隔离。"
+  },
+  "bot_profiles": {
+    "description": "机器人到 rsrs space 的映射",
+    "type": "template_list",
+    "default": [],
+    "templates": {
+      "bot_profile": {
+        "name": "机器人 profile",
+        "hint": "match 用 bot:<platform_id>:<self_id>；space 填 rsrs space 或 account 名。",
+        "display_item": "match",
+        "items": {
+          "match": {
+            "description": "匹配键",
+            "type": "string",
+            "default": ""
+          },
+          "space": {
+            "description": "space 名",
+            "type": "string",
+            "default": ""
+          }
+        }
+      }
+    }
+  },
+  "profile_fallback": {
+    "description": "机器人未匹配时",
+    "type": "string",
+    "default": "deny",
+    "options": ["deny", "main"],
+    "labels": ["拒绝记忆操作", "落主库"],
+    "hint": "deny 更安全；main 表示未配置的机器人仍使用默认 rsrs 库。"
+  },
+  "m3_dir": {
+    "description": "共享 BGE-M3 模型目录",
+    "type": "string",
+    "default": "",
+    "hint": "留空自动使用 ~/.rsrs/models/bge-m3（若存在）。独立 profile 无模型时建议填写。"
+  },
+  "space_list_ttl": {
+    "description": "space 列表缓存（秒）",
+    "type": "int",
+    "default": 60,
+    "slider": {"min": 10, "max": 600, "step": 10},
+    "hint": "缓存 rsrs space list 结果，避免每个请求都跑 CLI。"
+  },
   "access_mode": {
     "description": "记忆访问范围",
     "type": "string",
@@ -84,15 +137,15 @@
     "description": "记忆作用域",
     "type": "string",
     "default": "global",
-    "options": ["global", "sender", "session"],
-    "labels": ["全局共享", "按发送者", "按会话"],
-    "hint": "global 适合个人机器人；sender/session 通过 rsrs --project 做软隔离，不是加密级隔离。"
+    "options": ["global", "sender", "session", "persona", "bot_persona"],
+    "labels": ["全局共享", "按发送者", "按会话", "按人格", "按机器人+人格"],
+    "hint": "isolation_mode=bot 时推荐 persona：机器人 profile 已硬隔离，人格之间用 rsrs --project 软隔离。"
   },
   "project_prefix": {
     "description": "作用域前缀",
     "type": "string",
     "default": "astrbot",
-    "hint": "scope_mode=sender/session 时写入 rsrs 的 project 字段。"
+    "hint": "scope_mode=sender/session/persona/bot_persona 时写入 rsrs 的 project 字段。"
   },
   "store_prefixes": {
     "description": "存储请求前缀",

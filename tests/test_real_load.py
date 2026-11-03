@@ -95,7 +95,7 @@ async def run() -> dict:
         fail("plugin instance was not instantiated")
     if metadata.name != "astrbot_plugin_respire":
         fail(f"metadata.name = {metadata.name!r}")
-    if metadata.version != "0.1.0":
+    if metadata.version != "0.2.0":
         fail(f"metadata.version = {metadata.version!r}")
     if not metadata.activated:
         fail("plugin is not activated")
@@ -103,7 +103,15 @@ async def run() -> dict:
     config = metadata.config
     if not isinstance(config, AstrBotConfig):
         fail(f"config is {type(config).__name__}, expected AstrBotConfig")
-    for key, expected in (("enabled", True), ("recall_limit", 5), ("access_mode", "admin")):
+    for key, expected in (
+        ("enabled", True),
+        ("recall_limit", 5),
+        ("access_mode", "admin"),
+        ("isolation_mode", "off"),
+        ("scope_mode", "global"),
+        ("bot_profiles", []),
+        ("profile_fallback", "deny"),
+    ):
         if config.get(key) != expected:
             fail(f"config[{key}] = {config.get(key)!r}, expected {expected!r}")
 

@@ -71,6 +71,17 @@ def main(argv: list[str]) -> dict:
     state.setdefault("entries", {})
     state.setdefault("log", [])
     state["log"] = (state["log"] + [argv])[-300:]
+    state.setdefault("env_log", [])
+    state["env_log"] = (
+        state["env_log"]
+        + [
+            {
+                "argv": argv,
+                "data_dir": os.environ.get("RSRS_DATA_DIR", ""),
+                "m3_dir": os.environ.get("RSRS_M3_DIR", ""),
+            }
+        ]
+    )[-300:]
     state.setdefault("recall_rows", [])
     state.setdefault("candidates", {"merge": [], "parent": []})
     state.setdefault("chain_ancestors", [])
@@ -85,6 +96,21 @@ def main(argv: list[str]) -> dict:
 
     if command in state["fail"]:
         return _envelope(command, "fail", errors=[f"stub injected failure for {command}"])
+
+    if command == "space":
+        action = argv[1] if len(argv) > 1 else "list"
+        spaces = state.get("spaces") or [
+            {"name": "main", "dir": str(state_dir), "user": "stub", "current": True}
+        ]
+        persist()
+        if action == "list":
+            return _envelope(
+                command,
+                "ok",
+                summary={"action": "list", "count": len(spaces)},
+                details={"spaces": spaces, "current_dir": str(state_dir)},
+            )
+        return _envelope(command, "fail", errors=[f"stub: unsupported space action {action!r}"])
 
     if command == "status":
         state["summary"] = {

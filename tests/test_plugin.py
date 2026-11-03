@@ -817,6 +817,292 @@ class TestRealRsrsReadOnly:
 
 
 # ---------------------------------------------------------------------------
+# Bot-level hard isolation + persona-level soft scoping
+# ---------------------------------------------------------------------------
+
+
+def bot_event(*, platform: str = "test", self_id: str = "bot", persona: str | None = None, **kwargs):
+    event = make_event(platform=platform, **kwargs)
+    event.message_obj.self_id = self_id
+    if persona is not None:
+        event.set_extra("_trace_persona_id", persona)
+    return event
+
+
+def make_space_dir(tmp_path: Path, name: str = "botA", *, session: bool = True) -> Path:
+    space_dir = tmp_path / name
+    space_dir.mkdir(parents=True, exist_ok=True)
+    if session:
+        (space_dir / "session.json").write_text("{}", encoding="utf-8")
+    return space_dir
+
+
+class TestBotProfileIsolation:
+    async def test_bot_profile_sets_rsrs_data_dir(self, stub, tmp_path):
+        space_dir = make_space_dir(tmp_path)
+        model_dir = tmp_path / "models" / "bge-m3"
+        save_state(stub, {
+            "spaces": [{"name": "botA", "dir": str(space_dir)}],
+            "recall_rows": [{"id": "aaaaaaaa-0000", "title": "机器人隔离", "score": 0.8}],
+        })
+        plugin = make_plugin({
+            "rsrs_path": stub.path,
+            "isolation_mode": "bot",
+            "bot_profiles": [{"match": "bot:test:bot", "space": "botA"}],
+            "m3_dir": str(model_dir),
+        })
+        out = await plugin.tool_recall(bot_event(), "机器人隔离", 5)
+        assert RECALL_TAG in out and "机器人隔离" in out
+        calls = [
+            row for row in load_state(stub)["env_log"]
+            if row.get("argv", [""])[0] == "recall"
+        ]
+        assert calls
+        assert calls[-1]["data_dir"] == str(space_dir)
+        assert calls[-1]["m3_dir"] == str(model_dir)
+
+    async def test_space_list_is_cached(self, stub, tmp_path):
+        space_dir = make_space_dir(tmp_path)
+        save_state(stub, {
+            "spaces": [{"name": "botA", "dir": str(space_dir)}],
+            "recall_rows": [{"id": "aaaaaaaa-0000", "title": "缓存", "score": 0.8}],
+        })
+        plugin = make_plugin({
+            "rsrs_path": stub.path,
+            "isolation_mode": "bot",
+            "bot_profiles": [{"match": "bot:test:bot", "space": "botA"}],
+        })
+        await plugin.tool_recall(bot_event(), "缓存", 5)
+        await plugin.tool_recall(bot_event(), "缓存", 5)
+        space_calls = [
+            row for row in load_state(stub)["env_log"]
+            if row.get("argv", [""])[0] == "space"
+        ]
+        assert len(space_calls) == 1
+
+    async def test_persona_project_inside_bot_profile(self, stub, tmp_path):
+        space_dir = make_space_dir(tmp_path)
+        save_state(stub, {
+            "spaces": [{"name": "botA", "dir": str(space_dir)}],
+            "recall_rows": [{"id": "aaaaaaaa-0000", "title": "人格隔离", "score": 0.8}],
+        })
+        plugin = make_plugin({
+            "rsrs_path": stub.path,
+            "isolation_mode": "bot",
+            "scope_mode": "persona",
+            "bot_profiles": [{"match": "bot:test:bot", "space": "botA"}],
+        })
+        await plugin.tool_recall(bot_event(persona="猫娘"), "人格隔离", 5)
+        recalls = [
+            row["argv"] for row in load_state(stub)["env_log"]
+            if row.get("argv", [""])[0] == "recall"
+        ]
+        assert recalls
+        argv = recalls[-1]
+        assert "--project" in argv
+        assert argv[argv.index("--project") + 1] == "astrbot:persona:猫娘"
+
+    async def test_bot_profile_wildcard_and_default(self, stub, tmp_path):
+        space_dir = make_space_dir(tmp_path)
+        for match in ("bot:test:*", "default"):
+            save_state(stub, {
+                "spaces": [{"name": "botA", "dir": str(space_dir)}],
+                "recall_rows": [{"id": "aaaaaaaa-0000", "title": match, "score": 0.8}],
+            })
+            plugin = make_plugin({
+                "rsrs_path": stub.path,
+                "isolation_mode": "bot",
+                "bot_profiles": [{"match": match, "space": "botA"}],
+            })
+            out = await plugin.tool_recall(bot_event(), match, 5)
+            assert RECALL_TAG in out, match
+
+    async def test_persona_from_conversation_manager(self, stub, tmp_path):
+        space_dir = make_space_dir(tmp_path)
+        save_state(stub, {
+            "spaces": [{"name": "botA", "dir": str(space_dir)}],
+            "recall_rows": [{"id": "aaaaaaaa-0000", "title": "会话人格", "score": 0.8}],
+        })
+        plugin = make_plugin({
+            "rsrs_path": stub.path,
+            "isolation_mode": "bot",
+            "scope_mode": "persona",
+            "bot_profiles": [{"match": "bot:test:bot", "space": "botA"}],
+        })
+
+        class Manager:
+            async def get_curr_conversation_id(self, umo):
+                return "c1"
+
+            async def get_conversation(self, umo, cid):
+                return SimpleNamespace(persona_id="猫娘")
+
+        plugin.context = SimpleNamespace(conversation_manager=Manager())
+        await plugin.tool_recall(bot_event(), "会话人格", 5)
+        recalls = [
+            row["argv"] for row in load_state(stub)["env_log"]
+            if row.get("argv", [""])[0] == "recall"
+        ]
+        assert recalls
+        assert recalls[-1][recalls[-1].index("--project") + 1] == "astrbot:persona:猫娘"
+
+    async def test_scoped_candidate_preview_uses_project(self, stub, tmp_path):
+        space_dir = make_space_dir(tmp_path)
+        save_state(stub, {
+            "spaces": [{"name": "botA", "dir": str(space_dir)}],
+            "recall_rows": [{"id": "aaaaaaaa-0000", "title": "同人格候选", "score": 0.8}],
+            "candidates": {"merge": [{"entry": {"id": "bbbbbbbb", "title": "跨人格候选"}, "score": 0.9}]},
+        })
+        plugin = make_plugin({
+            "rsrs_path": stub.path,
+            "isolation_mode": "bot",
+            "scope_mode": "persona",
+            "bot_profiles": [{"match": "bot:test:bot", "space": "botA"}],
+        })
+        out = await plugin.tool_remember(
+            bot_event(persona="猫娘"), "待存事实", "待存标题", importance="important"
+        )
+        assert "Scoped candidates" in out
+        state = load_state(stub)
+        assert not any(row[0] == "candidates" for row in state["log"])
+        recall_args = next(row for row in state["log"] if row[0] == "recall")
+        assert recall_args[recall_args.index("--project") + 1] == "astrbot:persona:猫娘"
+
+    async def test_merge_keeps_persona_project(self, stub, tmp_path):
+        space_dir = make_space_dir(tmp_path)
+        save_state(stub, {"spaces": [{"name": "botA", "dir": str(space_dir)}]})
+        add_entry(stub, PARENT_ID, title="根父")
+        add_entry(stub, CHILD_ID, title="子", parent_id=PARENT_ID)
+        plugin = make_plugin({
+            "rsrs_path": stub.path,
+            "isolation_mode": "bot",
+            "scope_mode": "persona",
+            "bot_profiles": [{"match": "bot:test:bot", "space": "botA"}],
+        })
+        await plugin.tool_merge(
+            bot_event(persona="猫娘"),
+            "合并正文",
+            "合并标题",
+            CHILD_ID,
+            parent=PARENT_ID,
+        )
+        remembers = [
+            row for row in load_state(stub)["log"]
+            if row[0] == "remember" and "--merge-ids" in row
+        ]
+        assert remembers
+        argv = remembers[-1]
+        assert argv[argv.index("--project") + 1] == "astrbot:persona:猫娘"
+
+    async def test_status_reports_bot_profile(self, stub, tmp_path):
+        space_dir = make_space_dir(tmp_path)
+        save_state(stub, {"spaces": [{"name": "botA", "dir": str(space_dir)}]})
+        plugin = make_plugin({
+            "rsrs_path": stub.path,
+            "isolation_mode": "bot",
+            "bot_profiles": [{"match": "bot:test:bot", "space": "botA"}],
+        })
+        results = await collect_results(plugin.command_status(bot_event()))
+        text = result_text(results[0])
+        assert "profile: botA" in text
+        assert "unlocked: True" in text
+
+    async def test_unmapped_bot_fails_closed(self, stub, tmp_path):
+        plugin = make_plugin({
+            "rsrs_path": stub.path,
+            "isolation_mode": "bot",
+            "bot_profiles": [],
+            "profile_fallback": "deny",
+        })
+        out = await plugin.tool_recall(bot_event(), "未映射", 5)
+        assert "unavailable" in out
+        assert not any(
+            row.get("argv", [""])[0] == "recall"
+            for row in load_state(stub).get("env_log", [])
+        )
+
+    async def test_profile_fallback_main(self, stub, tmp_path, monkeypatch):
+        monkeypatch.delenv("RSRS_DATA_DIR", raising=False)
+        save_state(stub, {
+            "recall_rows": [{"id": "aaaaaaaa-0000", "title": "主库", "score": 0.8}],
+        })
+        plugin = make_plugin({
+            "rsrs_path": stub.path,
+            "isolation_mode": "bot",
+            "bot_profiles": [],
+            "profile_fallback": "main",
+        })
+        out = await plugin.tool_recall(bot_event(), "主库", 5)
+        assert RECALL_TAG in out
+        calls = [
+            row for row in load_state(stub)["env_log"]
+            if row.get("argv", [""])[0] == "recall"
+        ]
+        assert calls
+        assert calls[-1]["data_dir"] == ""
+
+    async def test_missing_space_fails_closed(self, stub, tmp_path):
+        save_state(stub, {"spaces": [{"name": "main", "dir": str(stub.state_dir)}]})
+        plugin = make_plugin({
+            "rsrs_path": stub.path,
+            "isolation_mode": "bot",
+            "bot_profiles": [{"match": "bot:test:bot", "space": "missing"}],
+        })
+        out = await plugin.tool_recall(bot_event(), "缺失", 5)
+        assert "does not exist" in out
+        assert not any(
+            row.get("argv", [""])[0] == "recall"
+            for row in load_state(stub).get("env_log", [])
+        )
+
+    async def test_uninitialized_space_fails_closed(self, stub, tmp_path):
+        space_dir = make_space_dir(tmp_path, session=False)
+        save_state(stub, {"spaces": [{"name": "botA", "dir": str(space_dir)}]})
+        plugin = make_plugin({
+            "rsrs_path": stub.path,
+            "isolation_mode": "bot",
+            "bot_profiles": [{"match": "bot:test:bot", "space": "botA"}],
+        })
+        out = await plugin.tool_recall(bot_event(), "未初始化", 5)
+        assert "not initialized" in out
+
+    def test_sidecar_env_profile_overrides_host(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RSRS_DATA_DIR", "/host/data")
+        monkeypatch.setenv("RSRS_M3_DIR", "/host/model")
+        profile = tmp_path / "profile"
+        model = tmp_path / "model"
+        env = sidecar_env(profile_dir=str(profile), m3_dir=str(model))
+        assert env["RSRS_DATA_DIR"] == str(profile)
+        assert env["RSRS_M3_DIR"] == str(model)
+
+    def test_bot_key_includes_self_id(self):
+        plugin = make_plugin({})
+        event = bot_event(platform="qq_main", self_id="123456")
+        assert plugin._bot_key(event) == "bot:qq_main:123456"
+
+    def test_persona_scope_keeps_unicode(self):
+        plugin = make_plugin({"scope_mode": "persona"})
+        event = bot_event(persona="猫娘")
+        assert plugin._scope_project(event) == "astrbot:persona:猫娘"
+
+    async def test_space_discovery_uses_main_profile(self, stub, tmp_path):
+        space_dir = make_space_dir(tmp_path)
+        save_state(stub, {"spaces": [{"name": "botA", "dir": str(space_dir)}]})
+        plugin = make_plugin({
+            "rsrs_path": stub.path,
+            "isolation_mode": "bot",
+            "bot_profiles": [{"match": "bot:test:bot", "space": "botA"}],
+        })
+        await plugin._load_space_dirs(force=True)
+        space_calls = [
+            row for row in load_state(stub)["env_log"]
+            if row.get("argv", [""])[0] == "space"
+        ]
+        assert space_calls
+        assert space_calls[-1]["data_dir"] == ""
+
+
+# ---------------------------------------------------------------------------
 # Config schema consistency
 # ---------------------------------------------------------------------------
 
@@ -831,6 +1117,9 @@ class TestConfigSchema:
     def test_defaults_sane(self):
         assert DEFAULTS["access_mode"] == "admin"
         assert DEFAULTS["group_memory"] is False
-        assert DEFAULTS["scope_mode"] in ("global", "sender", "session")
+        assert DEFAULTS["scope_mode"] in ("global", "sender", "session", "persona", "bot_persona")
+        assert DEFAULTS["isolation_mode"] == "off"
+        assert DEFAULTS["profile_fallback"] == "deny"
+        assert DEFAULTS["space_list_ttl"] >= 10
         assert DEFAULTS["recall_limit"] >= 1
         assert DEFAULTS["store_nudge_every"] >= 0

@@ -42,7 +42,7 @@ except Exception:  # pragma: no cover - very old hosts
     GreedyStr = str  # type: ignore[misc,assignment]
 
 
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.2.0"
 RULES_TAG = "<respire_memory_rules>"
 RULES_END = "</respire_memory_rules>"
 RECALL_TAG = "<respire_memory>"
@@ -57,6 +57,11 @@ STATUS_END = "</respire_status>"
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "rsrs_path": "",
+    "isolation_mode": "off",          # off | bot
+    "bot_profiles": [],
+    "profile_fallback": "deny",       # deny | main
+    "m3_dir": "",
+    "space_list_ttl": 60,
     "access_mode": "admin",          # admin | allowlist | all
     "allowed_users": [],
     "group_memory": False,
@@ -68,7 +73,7 @@ DEFAULTS: dict[str, Any] = {
     "max_show_chars": 8000,
     "max_tool_chars": 6000,
     "session_rules": True,
-    "scope_mode": "global",          # global | sender | session
+    "scope_mode": "global",          # global | sender | session | persona | bot_persona
     "project_prefix": "astrbot",
     "store_prefixes": ["记：", "记:", "存：", "存:", "remember:", "store:"],
     "store_nudge_every": 0,
@@ -185,8 +190,14 @@ _SIDECAR_SECRET_NAME = re.compile(
 )
 
 
-def sidecar_env() -> dict[str, str]:
-    """Minimal environment for the sidecar; never forward host credentials."""
+def sidecar_env(profile_dir: str = "", m3_dir: str = "") -> dict[str, str]:
+    """Minimal environment for the sidecar; never forward host credentials.
+
+    ``profile_dir`` is the absolute rsrs data directory for one bot space; it
+    overrides any host-level ``RSRS_DATA_DIR`` so concurrent bots never share a
+    runtime by accident.  ``m3_dir`` points every isolated profile at one
+    optional BGE-M3 model copy.
+    """
     env = {key: value for key, value in os.environ.items() if key in _SIDECAR_ENV_ALLOW}
     if os.name == "nt":  # pragma: no cover - Windows-only initialisation keys
         for key in (
@@ -207,6 +218,10 @@ def sidecar_env() -> dict[str, str]:
     for key, value in os.environ.items():
         if key.startswith(("RSRS_", "RESPIRE_")) and not _SIDECAR_SECRET_NAME.search(key):
             env[key] = value
+    if profile_dir.strip():
+        env["RSRS_DATA_DIR"] = os.path.abspath(os.path.expanduser(profile_dir.strip()))
+    if m3_dir.strip():
+        env["RSRS_M3_DIR"] = os.path.abspath(os.path.expanduser(m3_dir.strip()))
     return env
 
 
@@ -586,6 +601,9 @@ class RespireAstrBotPlugin(Star):
         self._probe_task: asyncio.Task | None = None
         self._probe_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
+        self._space_cache: dict[str, str] = {}
+        self._space_cache_at = 0.0
+        self._space_lock = asyncio.Lock()
         self._turns = 0
         self._last_store_at = 0.0
         self._log("plugin", "loaded", version=PLUGIN_VERSION, engine=bool(self._rsrs))
@@ -651,7 +669,11 @@ class RespireAstrBotPlugin(Star):
     # ---- engine access -------------------------------------------------
 
     async def _run(
-        self, args: list[str], timeout: float
+        self,
+        args: list[str],
+        timeout: float,
+        profile_dir: str = "",
+        m3_dir: str = "",
     ) -> tuple[dict[str, Any] | None, str | None]:
         """Run one rsrs command and return (envelope, error).  Never raises."""
         engine = self._rsrs or find_rsrs(self._cfg_str("rsrs_path"))
@@ -663,7 +685,7 @@ class RespireAstrBotPlugin(Star):
                 *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=sidecar_env(),
+                env=sidecar_env(profile_dir=profile_dir, m3_dir=m3_dir),
             )
         except Exception as exc:
             return None, f"spawn failed: {type(exc).__name__}"
@@ -695,6 +717,11 @@ class RespireAstrBotPlugin(Star):
     async def _recall(
         self, event: AstrMessageEvent, query: str, limit: int
     ) -> str:
+        profile = await self._resolve_profile(event)
+        if profile.get("error"):
+            self._log("recall", "profile_error", error=profile["error"])
+            return ""
+        await self._ensure_persona(event)
         args = [
             "recall",
             query,
@@ -706,7 +733,12 @@ class RespireAstrBotPlugin(Star):
         project = self._scope_project(event)
         if project:
             args += ["--project", project]
-        doc, error = await self._run(args, self._cfg_float("recall_timeout") or 14.0)
+        doc, error = await self._run(
+            args,
+            self._cfg_float("recall_timeout") or 14.0,
+            profile_dir=profile["dir"],
+            m3_dir=self._m3_dir(),
+        )
         if error:
             self._log("recall", "error", error=error)
             return ""
@@ -718,7 +750,11 @@ class RespireAstrBotPlugin(Star):
         )
 
     async def _read_entry(
-        self, entry_id: str, chain_depth: int = 0
+        self,
+        entry_id: str,
+        chain_depth: int = 0,
+        profile_dir: str = "",
+        m3_dir: str = "",
     ) -> tuple[dict[str, Any] | None, str | None]:
         entry_id = entry_id.strip()
         if not entry_id:
@@ -727,7 +763,12 @@ class RespireAstrBotPlugin(Star):
             args = ["chain", entry_id, "--depth", str(chain_depth), "--json"]
         else:
             args = ["show", entry_id, "--json"]
-        doc, error = await self._run(args, self._cfg_float("recall_timeout") or 14.0)
+        doc, error = await self._run(
+            args,
+            self._cfg_float("recall_timeout") or 14.0,
+            profile_dir=profile_dir,
+            m3_dir=m3_dir,
+        )
         if error:
             return None, error
         if not isinstance(doc, dict) or doc.get("status") != "ok":
@@ -735,9 +776,53 @@ class RespireAstrBotPlugin(Star):
             return None, f"read failed: {truncate(json.dumps(errors, ensure_ascii=False), 240)}" if errors else "read failed"
         return doc, None
 
-    async def _preview_candidates(self, content: str) -> str:
+    async def _preview_candidates(
+        self,
+        event: AstrMessageEvent,
+        content: str,
+        profile_dir: str = "",
+        m3_dir: str = "",
+    ) -> str:
+        project = self._scope_project(event)
+        if project:
+            doc, error = await self._run(
+                [
+                    "recall",
+                    content,
+                    "--titles",
+                    "--json",
+                    "--limit",
+                    "5",
+                    "--project",
+                    project,
+                ],
+                self._cfg_float("write_timeout") or 20.0,
+                profile_dir=profile_dir,
+                m3_dir=m3_dir,
+            )
+            if error:
+                return f"Could not preview scoped candidates ({error}); nothing was written."
+            block = format_recall(doc, 5, 0.0, 1200)
+            if block:
+                return (
+                    "Nothing was written. Scoped candidates from this profile/project:\n"
+                    + block
+                    + "\nRead the candidate bodies with respire_show before choosing "
+                    "respire_update > respire_merge > respire_attach > respire_remember."
+                )
+            return (
+                "Nothing was written. No scoped candidate was found, but a new important "
+                "entry still needs a real parent in this project. Recall a broad topic or "
+                "choose a taxonomy root, then pass its id. If this is only a diary note, "
+                "use importance='trivial'."
+            )
         args = ["candidates", content, "--json"]
-        doc, error = await self._run(args, self._cfg_float("write_timeout") or 20.0)
+        doc, error = await self._run(
+            args,
+            self._cfg_float("write_timeout") or 20.0,
+            profile_dir=profile_dir,
+            m3_dir=m3_dir,
+        )
         if error:
             return f"Could not preview candidates ({error}); nothing was written."
         text = format_candidates(doc)
@@ -765,10 +850,17 @@ class RespireAstrBotPlugin(Star):
         parent = parent.strip()
         if not content:
             return "Nothing was written: content is empty."
+        profile = await self._resolve_profile(event)
+        if profile.get("error"):
+            return f"Nothing was written: memory is unavailable for this bot ({profile['error']})."
+        await self._ensure_persona(event)
+        m3_dir = self._m3_dir()
         if importance == "important" and not parent:
-            return await self._preview_candidates(content)
+            return await self._preview_candidates(event, content, profile["dir"], m3_dir)
         if parent:
-            read_doc, read_error = await self._read_entry(parent)
+            read_doc, read_error = await self._read_entry(
+                parent, profile_dir=profile["dir"], m3_dir=m3_dir
+            )
             if read_error or not read_doc:
                 return (
                     f"Nothing was written: parent '{short_id(parent)}' could not be read "
@@ -794,7 +886,10 @@ class RespireAstrBotPlugin(Star):
             if project:
                 args += ["--project", project]
             doc, error = await self._run(
-                args, self._cfg_float("write_timeout") or 20.0
+                args,
+                self._cfg_float("write_timeout") or 20.0,
+                profile_dir=profile["dir"],
+                m3_dir=m3_dir,
             )
             if error and not isinstance(doc, dict):
                 return (
@@ -808,7 +903,9 @@ class RespireAstrBotPlugin(Star):
             )
             readback = None
             if isinstance(entry_id, str) and entry_id:
-                readback_doc, _ = await self._read_entry(entry_id)
+                readback_doc, _ = await self._read_entry(
+                    entry_id, profile_dir=profile["dir"], m3_dir=m3_dir
+                )
                 if isinstance(readback_doc, dict) and isinstance(
                     readback_doc.get("details"), dict
                 ):
@@ -819,6 +916,7 @@ class RespireAstrBotPlugin(Star):
 
     async def _update(
         self,
+        event: AstrMessageEvent,
         entry_id: str,
         content: str = "",
         title: str = "",
@@ -829,7 +927,14 @@ class RespireAstrBotPlugin(Star):
             return "entry_id is required."
         if not content.strip() and not title.strip() and not importance.strip():
             return "Nothing to update: provide content, title, or importance."
-        current_doc, current_error = await self._read_entry(entry_id)
+        profile = await self._resolve_profile(event)
+        if profile.get("error"):
+            return f"Memory is unavailable for this bot ({profile['error']})."
+        await self._ensure_persona(event)
+        m3_dir = self._m3_dir()
+        current_doc, current_error = await self._read_entry(
+            entry_id, profile_dir=profile["dir"], m3_dir=m3_dir
+        )
         if current_error or not current_doc:
             return f"Cannot update {short_id(entry_id)}: {current_error or 'not found'}"
         current_entry = (
@@ -854,7 +959,12 @@ class RespireAstrBotPlugin(Star):
                 args += ["--title", title]
             if importance in ("important", "trivial"):
                 args += ["--importance", importance]
-            doc, error = await self._run(args, self._cfg_float("write_timeout") or 20.0)
+            doc, error = await self._run(
+                args,
+                self._cfg_float("write_timeout") or 20.0,
+                profile_dir=profile["dir"],
+                m3_dir=m3_dir,
+            )
             if error and not isinstance(doc, dict):
                 return f"Update result unknown ({error}); verify read-only before retrying."
             entry_id_out = (
@@ -864,7 +974,9 @@ class RespireAstrBotPlugin(Star):
             )
             readback = None
             target = entry_id_out if isinstance(entry_id_out, str) and entry_id_out else entry_id
-            readback_doc, _ = await self._read_entry(target)
+            readback_doc, _ = await self._read_entry(
+                target, profile_dir=profile["dir"], m3_dir=m3_dir
+            )
             if isinstance(readback_doc, dict) and isinstance(
                 readback_doc.get("details"), dict
             ):
@@ -877,6 +989,7 @@ class RespireAstrBotPlugin(Star):
 
     async def _merge(
         self,
+        event: AstrMessageEvent,
         content: str,
         title: str,
         merge_ids: str,
@@ -886,7 +999,14 @@ class RespireAstrBotPlugin(Star):
         ids = [item.strip() for item in merge_ids.split(",") if item.strip()]
         if not ids:
             return "merge_ids is required (comma-separated ids)."
-        first_doc, error = await self._read_entry(ids[0])
+        profile = await self._resolve_profile(event)
+        if profile.get("error"):
+            return f"Memory is unavailable for this bot ({profile['error']})."
+        await self._ensure_persona(event)
+        m3_dir = self._m3_dir()
+        first_doc, error = await self._read_entry(
+            ids[0], profile_dir=profile["dir"], m3_dir=m3_dir
+        )
         if error or not first_doc:
             return f"Cannot merge: first source {short_id(ids[0])} could not be read ({error or 'missing'})."
         first_entry = (
@@ -913,7 +1033,15 @@ class RespireAstrBotPlugin(Star):
             ]
             if parent:
                 args += ["--parent", parent]
-            doc, error = await self._run(args, self._cfg_float("write_timeout") or 20.0)
+            project = self._scope_project(event)
+            if project:
+                args += ["--project", project]
+            doc, error = await self._run(
+                args,
+                self._cfg_float("write_timeout") or 20.0,
+                profile_dir=profile["dir"],
+                m3_dir=m3_dir,
+            )
             if error and not isinstance(doc, dict):
                 return f"Merge result unknown ({error}); verify read-only before retrying."
             entry_id = (
@@ -923,7 +1051,9 @@ class RespireAstrBotPlugin(Star):
             )
             readback = None
             if isinstance(entry_id, str) and entry_id:
-                readback_doc, _ = await self._read_entry(entry_id)
+                readback_doc, _ = await self._read_entry(
+                    entry_id, profile_dir=profile["dir"], m3_dir=m3_dir
+                )
                 if isinstance(readback_doc, dict) and isinstance(
                     readback_doc.get("details"), dict
                 ):
@@ -932,17 +1062,26 @@ class RespireAstrBotPlugin(Star):
                 self._last_store_at = time.time()
             return _format_store_result(doc, title, content, readback)
 
-    async def _attach(self, child_id: str, parent_id: str) -> str:
+    async def _attach(self, event: AstrMessageEvent, child_id: str, parent_id: str) -> str:
         if not child_id.strip() or not parent_id.strip():
             return "child_id and parent_id are required."
+        profile = await self._resolve_profile(event)
+        if profile.get("error"):
+            return f"Memory is unavailable for this bot ({profile['error']})."
+        await self._ensure_persona(event)
+        m3_dir = self._m3_dir()
         for value in (child_id, parent_id):
-            doc, error = await self._read_entry(value)
+            doc, error = await self._read_entry(
+                value, profile_dir=profile["dir"], m3_dir=m3_dir
+            )
             if error or not doc:
                 return f"Cannot attach: {short_id(value)} could not be read ({error or 'missing'})."
         async with self._write_lock:
             doc, error = await self._run(
                 ["attach", child_id, "--parent", parent_id, "--json"],
                 self._cfg_float("write_timeout") or 20.0,
+                profile_dir=profile["dir"],
+                m3_dir=m3_dir,
             )
             if error and not isinstance(doc, dict):
                 return f"Attach result unknown ({error}); verify read-only before retrying."
@@ -992,6 +1131,9 @@ class RespireAstrBotPlugin(Star):
             return self._probe
 
     def _probe_note(self) -> str:
+        if (self._cfg_str("isolation_mode") or "off").lower() == "bot":
+            # A global probe would report the main library, not this bot's space.
+            return ""
         probe = self._probe
         if not probe:
             return ""
@@ -1042,6 +1184,180 @@ class RespireAstrBotPlugin(Star):
                 pass
         return ""
 
+    def _self_id(self, event: AstrMessageEvent) -> str:
+        getter = getattr(event, "get_self_id", None)
+        if callable(getter):
+            try:
+                value = getter()
+                if value:
+                    return str(value)
+            except Exception:
+                pass
+        return str(getattr(getattr(event, "message_obj", None), "self_id", "") or "")
+
+    def _bot_key(self, event: AstrMessageEvent) -> str:
+        platform = self._platform_id(event)
+        self_id = self._self_id(event)
+        if not platform and not self_id:
+            return ""
+        return f"bot:{platform}:{self_id}"
+
+    def _persona_id(self, event: AstrMessageEvent, req: Any = None) -> str:
+        for key in ("_respire_persona_id", "_trace_persona_id"):
+            if hasattr(event, "get_extra"):
+                try:
+                    raw = event.get_extra(key)
+                except Exception:
+                    raw = None
+                if raw and str(raw) != "[%None]":
+                    return str(raw).strip() or "default"
+        if req is not None:
+            conversation = getattr(req, "conversation", None)
+            raw = getattr(conversation, "persona_id", None)
+            if raw and str(raw) != "[%None]":
+                return str(raw).strip() or "default"
+        return "default"
+
+    async def _ensure_persona(self, event: AstrMessageEvent, req: Any = None) -> str:
+        """Resolve and cache the effective persona for commands and tools."""
+        persona = self._persona_id(event, req)
+        cached = False
+        if hasattr(event, "get_extra"):
+            try:
+                cached = bool(event.get_extra("_respire_persona_id"))
+            except Exception:
+                cached = False
+        if not cached and persona == "default":
+            manager = getattr(self.context, "conversation_manager", None)
+            if manager is not None:
+                try:
+                    umo = getattr(event, "unified_msg_origin", "")
+                    cid = await manager.get_curr_conversation_id(umo)
+                    if cid:
+                        conversation = await manager.get_conversation(umo, cid)
+                        raw = getattr(conversation, "persona_id", None)
+                        if raw and str(raw) != "[%None]":
+                            persona = str(raw).strip() or "default"
+                except Exception:
+                    pass
+        if hasattr(event, "set_extra"):
+            event.set_extra("_respire_persona_id", persona)
+        return persona
+
+    def _bot_profile_map(self) -> dict[str, str]:
+        raw = self._cfg("bot_profiles")
+        mapping: dict[str, str] = {}
+        if isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                match = str(item.get("match") or "").strip()
+                space = str(item.get("space") or "").strip()
+                if match and space:
+                    mapping[match] = space
+        elif isinstance(raw, dict):
+            for match, space in raw.items():
+                match_text = str(match or "").strip()
+                space_text = str(space or "").strip()
+                if match_text and space_text:
+                    mapping[match_text] = space_text
+        return mapping
+
+    def _m3_dir(self) -> str:
+        configured = self._cfg_str("m3_dir")
+        if configured:
+            return os.path.expanduser(configured)
+        if (self._cfg_str("isolation_mode") or "off").lower() != "bot":
+            return ""
+        shared = os.path.expanduser("~/.rsrs/models/bge-m3")
+        return shared if os.path.isdir(shared) else ""
+
+    async def _load_space_dirs(
+        self, force: bool = False
+    ) -> tuple[dict[str, str], str | None]:
+        ttl = max(10, self._cfg_int("space_list_ttl") or 60)
+        async with self._space_lock:
+            now = time.time()
+            if not force and self._space_cache and now - self._space_cache_at < ttl:
+                return dict(self._space_cache), None
+            doc, error = await self._run(
+                ["space", "list", "--json"],
+                self._cfg_float("status_timeout") or 10.0,
+            )
+            if error:
+                return {}, error
+            if not isinstance(doc, dict) or doc.get("status") != "ok":
+                return {}, "space list returned an unexpected receipt"
+            details = doc.get("details")
+            rows = details.get("spaces") if isinstance(details, dict) else None
+            mapping: dict[str, str] = {}
+            if isinstance(rows, list):
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    name = str(row.get("name") or "").strip()
+                    directory = str(row.get("dir") or "").strip()
+                    if name and directory:
+                        mapping[name] = directory
+            self._space_cache = mapping
+            self._space_cache_at = now
+            return dict(mapping), None
+
+    async def _resolve_profile(
+        self, event: AstrMessageEvent, req: Any = None
+    ) -> dict[str, Any]:
+        """Resolve the per-bot rsrs data dir; fail closed when unmapped."""
+        result: dict[str, Any] = {
+            "enabled": False,
+            "key": "",
+            "space": "",
+            "dir": "",
+            "error": "",
+        }
+        if (self._cfg_str("isolation_mode") or "off").lower() != "bot":
+            return result
+        key = self._bot_key(event)
+        result["key"] = key
+        if not key:
+            result["error"] = "cannot identify the current bot"
+            return result
+        mapping = self._bot_profile_map()
+        platform = self._platform_id(event)
+        candidates = [key]
+        if platform:
+            candidates.append(f"bot:{platform}:*")
+        candidates.append("default")
+        space = ""
+        for candidate in candidates:
+            if candidate in mapping:
+                space = mapping[candidate]
+                break
+        if not space:
+            if (self._cfg_str("profile_fallback") or "deny").lower() == "main":
+                result.update(enabled=True, space="main")
+            else:
+                result["error"] = "no bot memory profile is configured"
+            return result
+        if space == "main":
+            result.update(enabled=True, space="main")
+            return result
+        dirs, error = await self._load_space_dirs()
+        if error:
+            result["error"] = f"space list failed ({error})"
+            return result
+        profile_dir = dirs.get(space, "")
+        if not profile_dir:
+            result["error"] = f"space '{space}' does not exist"
+            return result
+        if not os.path.isdir(profile_dir):
+            result["error"] = f"space '{space}' directory is missing"
+            return result
+        if not os.path.isfile(os.path.join(profile_dir, "session.json")):
+            result["error"] = f"space '{space}' is not initialized"
+            return result
+        result.update(enabled=True, space=space, dir=profile_dir)
+        return result
+
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         try:
             if getattr(event, "is_admin", None) and event.is_admin():
@@ -1079,14 +1395,22 @@ class RespireAstrBotPlugin(Star):
 
     def _scope_project(self, event: AstrMessageEvent) -> str:
         mode = (self._cfg_str("scope_mode") or "global").lower()
-        if mode not in ("sender", "session"):
+        if mode not in ("sender", "session", "persona", "bot_persona"):
             return ""
         prefix = self._cfg_str("project_prefix") or "astrbot"
         if mode == "sender":
             identity = f"{self._platform_id(event)}:user:{self._sender_id(event)}"
-        else:
+        elif mode == "session":
             identity = f"session:{getattr(event, 'unified_msg_origin', '')}"
+        elif mode == "persona":
+            identity = f"persona:{self._persona_id(event)}"
+        else:
+            identity = f"{self._bot_key(event)}:persona:{self._persona_id(event)}"
         project = f"{prefix}:{identity}"
+        if mode in ("persona", "bot_persona"):
+            project = re.sub(r"[\x00-\x1f\x7f]", "", project)
+            project = re.sub(r"\s+", "_", project)
+            return project[:200]
         return re.sub(r"[^0-9A-Za-z_.:\-]", "_", project)[:200]
 
     # ---- prompt injection ---------------------------------------------
@@ -1153,6 +1477,15 @@ class RespireAstrBotPlugin(Star):
                 return
             query = str(getattr(req, "prompt", "") or getattr(event, "message_str", "") or "").strip()
             self._append_system_rules(req)
+            await self._ensure_persona(event, req)
+            profile = await self._resolve_profile(event, req)
+            if profile.get("error"):
+                self._append_part(
+                    req,
+                    f"{STATUS_TAG}\nRespire memory is unavailable for this bot: "
+                    f"{profile['error']}. Do not claim memory access.\n{STATUS_END}",
+                )
+                return
             if not query:
                 return
             if re.match(r"^[/!]?nomem\b", query, re.I):
@@ -1169,7 +1502,13 @@ class RespireAstrBotPlugin(Star):
             if not self._cfg_bool("auto_recall"):
                 return
             key = hashlib.sha256(
-                (self._scope_project(event) + "\0" + query[:2000]).encode("utf-8")
+                (
+                    str(profile.get("key") or "")
+                    + "\0"
+                    + self._scope_project(event)
+                    + "\0"
+                    + query[:2000]
+                ).encode("utf-8")
             ).hexdigest()
             if self._already_injected(event, key):
                 return
@@ -1219,8 +1558,20 @@ class RespireAstrBotPlugin(Star):
                 "or `rsrs keygen`."
             )
             return
+        if (self._cfg_str("isolation_mode") or "off").lower() == "bot":
+            await self._load_space_dirs(force=True)
+        profile = await self._resolve_profile(event)
+        if profile.get("error"):
+            yield event.plain_result(
+                f"respire profile unavailable ({profile['error']}). "
+                "Configure bot_profiles or set profile_fallback=main."
+            )
+            return
         doc, error = await self._run(
-            ["status", "--json"], self._cfg_float("status_timeout") or 10.0
+            ["status", "--json"],
+            self._cfg_float("status_timeout") or 10.0,
+            profile_dir=profile["dir"],
+            m3_dir=self._m3_dir(),
         )
         if error or not isinstance(doc, dict) or doc.get("status") != "ok":
             yield event.plain_result(f"respire status failed: {error or 'unexpected receipt'}")
@@ -1239,7 +1590,12 @@ class RespireAstrBotPlugin(Star):
             "user": "",
         }
         self._probe_at = time.time()
-        yield event.plain_result(format_status(doc) or "respire status returned no summary.")
+        profile_line = f"profile: {profile.get('space') or 'main'}"
+        if profile.get("key"):
+            profile_line += f" ({profile['key']})"
+        yield event.plain_result(
+            f"{profile_line}\n{format_status(doc) or 'respire status returned no summary.'}"
+        )
 
     @respire_group.command("recall")
     async def command_recall(self, event: AstrMessageEvent, query: GreedyStr = ""):
@@ -1254,6 +1610,10 @@ class RespireAstrBotPlugin(Star):
             return
         if contains_secret(query):
             yield event.plain_result("Query looks like a credential; not sent to memory.")
+            return
+        profile = await self._resolve_profile(event)
+        if profile.get("error"):
+            yield event.plain_result(f"respire recall failed: {profile['error']}")
             return
         block = await self._recall(event, query, self._cfg_int("recall_limit") or 5)
         if not block:
@@ -1276,7 +1636,16 @@ class RespireAstrBotPlugin(Star):
             return
         entry_id = tokens[0]
         depth = as_int(tokens[1], 0, minimum=0, maximum=3) if len(tokens) > 1 else 0
-        doc, error = await self._read_entry(entry_id, depth)
+        profile = await self._resolve_profile(event)
+        if profile.get("error"):
+            yield event.plain_result(f"respire show failed: {profile['error']}")
+            return
+        doc, error = await self._read_entry(
+            entry_id,
+            depth,
+            profile_dir=profile["dir"],
+            m3_dir=self._m3_dir(),
+        )
         if error or not doc:
             yield event.plain_result(f"respire show failed: {error or 'not found'}")
             return
@@ -1339,8 +1708,15 @@ class RespireAstrBotPlugin(Star):
         if not entry_id:
             yield event.plain_result("Usage: /respire forget <id> --yes")
             return
+        profile = await self._resolve_profile(event)
+        if profile.get("error"):
+            yield event.plain_result(f"respire forget failed: {profile['error']}")
+            return
         doc, error = await self._run(
-            ["forget", entry_id, "--json"], self._cfg_float("write_timeout") or 20.0
+            ["forget", entry_id, "--json"],
+            self._cfg_float("write_timeout") or 20.0,
+            profile_dir=profile["dir"],
+            m3_dir=self._m3_dir(),
         )
         if error or not isinstance(doc, dict):
             yield event.plain_result(f"respire forget failed: {error or 'unexpected receipt'}")
@@ -1375,6 +1751,9 @@ class RespireAstrBotPlugin(Star):
             return "query is required."
         if contains_secret(query):
             return "Query looks like a credential; not sent to memory."
+        profile = await self._resolve_profile(event)
+        if profile.get("error"):
+            return f"Memory is unavailable for this bot ({profile['error']})."
         safe_limit = as_int(limit, 5, minimum=1, maximum=20)
         block = await self._recall(event, query, safe_limit)
         if not block:
@@ -1398,7 +1777,15 @@ class RespireAstrBotPlugin(Star):
         if not allowed:
             return reason
         depth = as_int(chain_depth, 0, minimum=0, maximum=3)
-        doc, error = await self._read_entry(str(entry_id or "").strip(), depth)
+        profile = await self._resolve_profile(event)
+        if profile.get("error"):
+            return f"read failed: {profile['error']}"
+        doc, error = await self._read_entry(
+            str(entry_id or "").strip(),
+            depth,
+            profile_dir=profile["dir"],
+            m3_dir=self._m3_dir(),
+        )
         if error or not doc:
             return f"read failed: {error or 'not found'}"
         text = format_chain(doc, self._cfg_int("max_show_chars") or 8000) if depth else format_show(
@@ -1470,6 +1857,7 @@ class RespireAstrBotPlugin(Star):
         if importance not in ("", "important", "trivial"):
             return "importance must be important, trivial, or empty."
         return await self._update(
+            event,
             str(entry_id or "").strip(),
             str(content or ""),
             str(title or ""),
@@ -1503,6 +1891,7 @@ class RespireAstrBotPlugin(Star):
         if not content or not title:
             return "content and title are required."
         return await self._merge(
+            event,
             content,
             title,
             str(merge_ids or ""),
@@ -1523,7 +1912,11 @@ class RespireAstrBotPlugin(Star):
         allowed, reason = self._memory_allowed(event)
         if not allowed:
             return reason
-        return await self._attach(str(child_id or "").strip(), str(parent_id or "").strip())
+        return await self._attach(
+            event,
+            str(child_id or "").strip(),
+            str(parent_id or "").strip(),
+        )
 
 
 def _parse_command_flags(text: str) -> tuple[dict[str, str], str]:
